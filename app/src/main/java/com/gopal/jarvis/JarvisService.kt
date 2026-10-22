@@ -39,7 +39,6 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     companion object {
         var log: ((String) -> Unit)? = null
         @Volatile var running = false
-        const val MODEL = "gemini-2.5-flash"
         val WAKES = listOf("jarvis", "jarves", "jarwis", "जार्विस", "जारविस", "जार्वीस", "जर्विस")
         const val SYS = """Tu Jarvis hai, Gopal ka personal Android phone assistant. User Hinglish/Hindi mein bolta hai.
 Reply ONLY valid JSON: {"say":"ek chhota sentence Devanagari Hindi mein","actions":[...],"done":true}
@@ -192,19 +191,8 @@ Rules: CURRENT SCREEN mein jo dikh raha hai wahi use kar, click_text mein screen
         h.post { awakeUntil = System.currentTimeMillis() + 8000; if (pending.get() == 0) listen() }
     }
 
-    private fun gemini(goal: String, screen: String, did: String): JSONObject {
-        val key = getSharedPreferences("j", MODE_PRIVATE).getString("k", "") ?: ""
-        if (key.isBlank()) throw Exception("API key daalo")
-        val user = "Conversation:\n" + history.takeLast(6).joinToString("\n") +
-            "\n\nGOAL: $goal\n\nACTIONS ALREADY DONE:\n$did\n\nCURRENT SCREEN:\n$screen"
-        val body = JSONObject()
-            .put("system_instruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYS))))
-            .put("contents", JSONArray().put(JSONObject().put("role", "user")
-                .put("parts", JSONArray().put(JSONObject().put("text", user)))))
-            .put("generationConfig", JSONObject()
-                .put("responseMimeType", "application/json")
-                .put("thinkingConfig", JSONObject().put("thinkingBudget", 0)))
-        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent")
+    private fun post(model: String, body: JSONObject, key: String): Pair<Int, String> {
+        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
             .openConnection() as HttpURLConnection
         c.requestMethod = "POST"
         c.setRequestProperty("Content-Type", "application/json")
@@ -215,10 +203,71 @@ Rules: CURRENT SCREEN mein jo dikh raha hai wahi use kar, click_text mein screen
         c.outputStream.use { it.write(body.toString().toByteArray()) }
         val code = c.responseCode
         val txt = (if (code in 200..299) c.inputStream else c.errorStream).bufferedReader().readText()
-        if (code !in 200..299) throw Exception("Gemini $code")
-        val out = JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
-            .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
-        return JSONObject(out.trim().removePrefix("```json").removeSuffix("```").trim())
+        return Pair(code, txt)
+    }
+
+    private fun listModels(key: String): List<String> {
+        val c = URL("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200")
+            .openConnection() as HttpURLConnection
+        c.setRequestProperty("x-goog-api-key", key)
+        val arr = JSONObject(c.inputStream.bufferedReader().readText()).getJSONArray("models")
+        val out = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            val m = arr.getJSONObject(i)
+            val name = m.getString("name").removePrefix("models/")
+            val ok = m.optJSONArray("supportedGenerationMethods")?.toString()?.contains("generateContent") == true
+            val bad = listOf("image", "tts", "live", "audio", "thinking", "exp").any { name.contains(it) }
+            if (ok && !bad && name.contains("flash")) out.add(name)
+        }
+        return out.sortedBy { (if (it.contains("preview")) 1 else 0) + (if (it.contains("lite")) 2 else 0) }
+    }
+
+    private fun gemini(goal: String, screen: String, did: String): JSONObject {
+        val sp = getSharedPreferences("j", MODE_PRIVATE)
+        val key = sp.getString("k", "") ?: ""
+        if (key.isBlank()) throw Exception("API key daalo")
+        val user = "Conversation:\n" + history.takeLast(6).joinToString("\n") +
+            "\n\nGOAL: $goal\n\nACTIONS ALREADY DONE:\n$did\n\nCURRENT SCREEN:\n$screen"
+
+        fun body(think: Boolean): JSONObject {
+            val g = JSONObject().put("responseMimeType", "application/json")
+            if (think) g.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+            return JSONObject()
+                .put("system_instruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYS))))
+                .put("contents", JSONArray().put(JSONObject().put("role", "user")
+                    .put("parts", JSONArray().put(JSONObject().put("text", user)))))
+                .put("generationConfig", g)
+        }
+
+        val queue = mutableListOf(
+            sp.getString("m", "") ?: "", "gemini-flash-latest", "gemini-2.5-flash",
+            "gemini-3-flash-preview", "gemini-2.0-flash", "gemini-2.5-flash-lite"
+        ).filter { it.isNotBlank() }.toMutableList()
+        val tried = mutableSetOf<String>()
+        var listed = false
+
+        while (true) {
+            if (queue.isEmpty()) {
+                if (listed) throw Exception("Koi Gemini model nahi mila")
+                listed = true
+                queue.addAll(listModels(key))
+                continue
+            }
+            val m = queue.removeAt(0)
+            if (!tried.add(m)) continue
+            var r = post(m, body(true), key)
+            if (r.first == 400) r = post(m, body(false), key)
+            if (r.first in 200..299) {
+                sp.edit().putString("m", m).apply()
+                val out = JSONObject(r.second).getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                return JSONObject(out.trim().removePrefix("```json").removeSuffix("```").trim())
+            }
+            if (r.first == 404) continue
+            val msg = try { JSONObject(r.second).getJSONObject("error").getString("message").take(120) } catch (e: Exception) { "" }
+            if (r.first == 429) throw Exception("Gemini limit (429), thoda ruko")
+            throw Exception("Gemini ${r.first} $msg")
+        }
     }
 
     // ---------------- Actions ----------------
